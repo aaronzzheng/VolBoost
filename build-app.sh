@@ -42,9 +42,18 @@ codesign --force --sign - --timestamp=none "$APP" >/dev/null 2>&1 \
 echo "built $(pwd)/$APP"
 
 if [ "$INSTALL" = 1 ]; then
+  # `open` fails with -600 if it races a copy that is still shutting down, so
+  # wait for the old process to actually go away before replacing the bundle.
   osascript -e 'quit app "VolBoost"' >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do
+    pgrep -f "VolBoost.app/Contents/MacOS/VolBoost" >/dev/null 2>&1 || break
+    sleep 0.25
+  done
+
   rm -rf "/Applications/$APP"
   cp -R "$APP" /Applications/
-  open "/Applications/$APP"
+
+  # LaunchServices also needs a moment to notice the replaced bundle.
+  open "/Applications/$APP" || { sleep 1; open "/Applications/$APP"; }
   echo "installed and launched /Applications/$APP"
 fi
