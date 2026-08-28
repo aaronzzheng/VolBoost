@@ -45,6 +45,14 @@ Click the menu bar icon. Every app currently producing output gets a row:
 | Bolt button | Enable boost — slider range becomes 0–400% |
 | Launch at login | Registers the bundle via `SMAppService.mainApp` |
 
+Volumes are remembered. Settings are keyed by bundle identifier and stored in
+`UserDefaults`, so muting Discord or dropping it to 40% sticks — quit it, reboot, and
+it comes back at 40% the moment it plays audio again. Drag an app back to 100% and
+unmute it and VolBoost forgets it entirely rather than storing a no-op.
+
+A process with no bundle identifier (some helpers) still works for the current
+session, it just cannot be recognised next launch.
+
 Right-click the menu bar icon (or use **Quit** in the popover) to exit.
 
 VolBoost does not launch at login until you flip that switch — the popover reads its
@@ -83,6 +91,9 @@ square waves.
 
 ## Known limits
 
+- A remembered volume is re-applied silently when the app next plays audio. If that
+  fails, VolBoost does not retry for that app until you touch its slider again —
+  otherwise the refresh timer would re-alert every 1.5 seconds.
 - A tap pipeline is created on first adjustment and kept until the process exits. Dragging
   back to exactly 100% is a passthrough `memcpy`; tearing the aggregate device down
   mid-drag would glitch the audio instead.

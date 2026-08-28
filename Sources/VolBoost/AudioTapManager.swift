@@ -239,6 +239,9 @@ final class AudioTapManager: ObservableObject {
     struct AudioApp: Identifiable, Equatable {
         let id: pid_t
         let objectID: AudioObjectID
+        /// Stable across launches — the bundle ID where there is one. Settings are
+        /// stored under this, not the pid, so a volume survives quitting the app.
+        let settingsKey: String
         let name: String
         let icon: NSImage?
         var gainPercent: Double   // 100 == unity
@@ -260,16 +263,22 @@ final class AudioTapManager: ObservableObject {
 
     @Published private(set) var apps: [AudioApp] = []
 
-    private struct Settings {
+    private struct Settings: Codable, Equatable {
         var gainPercent: Double = 100
         var isMuted = false
         var boostEnabled = false
 
         var linearGain: Float { isMuted ? 0 : Float(gainPercent / 100) }
         var needsTap: Bool { isMuted || abs(gainPercent - 100) > 0.5 }
+        /// Nothing worth remembering — used to drop the entry rather than store a no-op.
+        var isDefault: Bool { self == Settings() }
     }
 
-    private var settings: [pid_t: Settings] = [:]
+    private static let settingsDefaultsKey = "VolBoost.settings"
+    private var settings: [String: Settings] = [:]
+    /// Apps whose remembered volume could not be re-applied. Without this the
+    /// refresh timer would retry — and re-alert — every 1.5 seconds.
+    private var autoStartFailed: Set<String> = []
     private var sessions: [pid_t: TapSession] = [:]
     private var refreshTimer: Timer?
     private var hasShownPermissionAlert = false
@@ -277,6 +286,7 @@ final class AudioTapManager: ObservableObject {
     // MARK: Lifecycle
 
     func start() {
+        loadSettings()
         refresh()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             self?.refresh()
@@ -327,9 +337,25 @@ final class AudioTapManager: ObservableObject {
                 ?? bundleID?.split(separator: ".").last.map(String.init)
                 ?? "PID \(pid)"
 
-            let appSettings = settings[pid] ?? Settings()
+            // Processes without a bundle ID cannot be recognised next launch; they
+            // still work for this session, they just do not persist.
+            let settingsKey = bundleID ?? "pid:\(pid)"
+            let appSettings = settings[settingsKey] ?? Settings()
+
+            // A remembered volume has to be re-applied when the app comes back,
+            // otherwise persisting it was pointless. Silent: the user did not ask
+            // for this right now, so a failure must not interrupt them.
+            if appSettings.needsTap, sessions[pid] == nil,
+               !autoStartFailed.contains(settingsKey) {
+                let started = startSession(for: pid, objectID: objectID,
+                                           name: name, gain: appSettings.linearGain,
+                                           announceFailure: false)
+                if !started { autoStartFailed.insert(settingsKey) }
+            }
+
             discovered.append(AudioApp(id: pid,
                                        objectID: objectID,
+                                       settingsKey: settingsKey,
                                        name: name,
                                        icon: runningApp?.icon,
                                        gainPercent: appSettings.gainPercent,
@@ -338,10 +364,10 @@ final class AudioTapManager: ObservableObject {
                                        isControlled: sessions[pid] != nil))
         }
 
-        // Tear down pipelines for processes that are gone.
+        // Tear down pipelines for processes that are gone. Their settings stay:
+        // that is the whole point of keying them by bundle ID.
         for pid in Array(sessions.keys) where !livePIDs.contains(pid) {
             sessions.removeValue(forKey: pid)?.invalidate()
-            settings.removeValue(forKey: pid)
         }
 
         let sorted = discovered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -351,26 +377,37 @@ final class AudioTapManager: ObservableObject {
     // MARK: Control
 
     func setGainPercent(_ percent: Double, for app: AudioApp) {
-        var appSettings = settings[app.id] ?? Settings()
+        var appSettings = settings[app.settingsKey] ?? Settings()
         appSettings.gainPercent = min(max(percent, 0), Self.maxBoostPercent)
         apply(appSettings, to: app)
     }
 
     func toggleMute(for app: AudioApp) {
-        var appSettings = settings[app.id] ?? Settings()
+        var appSettings = settings[app.settingsKey] ?? Settings()
         appSettings.isMuted.toggle()
         apply(appSettings, to: app)
     }
 
     func setBoostEnabled(_ enabled: Bool, for app: AudioApp) {
-        var appSettings = settings[app.id] ?? Settings()
+        var appSettings = settings[app.settingsKey] ?? Settings()
         appSettings.boostEnabled = enabled
         if !enabled { appSettings.gainPercent = min(appSettings.gainPercent, 100) }
         apply(appSettings, to: app)
     }
 
     private func apply(_ appSettings: Settings, to app: AudioApp) {
-        settings[app.id] = appSettings
+        // An explicit adjustment is a fresh mandate: allow retrying a tap that
+        // failed to auto-start earlier.
+        autoStartFailed.remove(app.settingsKey)
+
+        // Storing a default would resurrect unity gain on every future launch for
+        // no reason, so back at 100% and unmuted means forget the app entirely.
+        if appSettings.isDefault {
+            settings.removeValue(forKey: app.settingsKey)
+        } else {
+            settings[app.settingsKey] = appSettings
+        }
+        persistSettings()
 
         if appSettings.needsTap, sessions[app.id] == nil {
             startSession(for: app, gain: appSettings.linearGain)
@@ -383,23 +420,50 @@ final class AudioTapManager: ObservableObject {
         refresh()
     }
 
-    private func startSession(for app: AudioApp, gain: Float) {
-        guard let outputUID = defaultOutputDeviceUID() else { return }
+    @discardableResult
+    private func startSession(for app: AudioApp, gain: Float) -> Bool {
+        startSession(for: app.id, objectID: app.objectID, name: app.name,
+                     gain: gain, announceFailure: true)
+    }
+
+    @discardableResult
+    private func startSession(for pid: pid_t, objectID: AudioObjectID, name: String,
+                              gain: Float, announceFailure: Bool) -> Bool {
+        guard let outputUID = defaultOutputDeviceUID() else { return false }
         do {
-            sessions[app.id] = try TapSession(processObjectID: app.objectID,
-                                              pid: app.id,
-                                              outputDeviceUID: outputUID,
-                                              gain: gain)
+            sessions[pid] = try TapSession(processObjectID: objectID,
+                                           pid: pid,
+                                           outputDeviceUID: outputUID,
+                                           gain: gain)
+            return true
         } catch let error as TapError {
-            settings[app.id] = Settings()
+            // The permission alert is worth showing either way — it is shown once
+            // in the app's lifetime and explains why nothing is happening.
             if error.looksLikePermissionDenial {
                 presentPermissionAlert()
-            } else {
-                presentFailureAlert(error, appName: app.name)
+            } else if announceFailure {
+                presentFailureAlert(error, appName: name)
             }
+            return false
         } catch {
-            settings[app.id] = Settings()
+            // Leave the stored setting alone: a transient failure should not
+            // silently discard a volume the user chose.
+            return false
         }
+    }
+
+    // MARK: Persistence
+
+    private func loadSettings() {
+        guard let data = UserDefaults.standard.data(forKey: Self.settingsDefaultsKey),
+              let stored = try? JSONDecoder().decode([String: Settings].self, from: data)
+        else { return }
+        settings = stored
+    }
+
+    private func persistSettings() {
+        guard let data = try? JSONEncoder().encode(settings) else { return }
+        UserDefaults.standard.set(data, forKey: Self.settingsDefaultsKey)
     }
 
     /// Rebuild every live pipeline against the new default output device.
@@ -408,7 +472,7 @@ final class AudioTapManager: ObservableObject {
         for session in sessions.values { session.invalidate() }
         sessions.removeAll()
         for app in controlled {
-            let appSettings = settings[app.id] ?? Settings()
+            let appSettings = settings[app.settingsKey] ?? Settings()
             if appSettings.needsTap { startSession(for: app, gain: appSettings.linearGain) }
         }
         refresh()
