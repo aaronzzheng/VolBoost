@@ -67,14 +67,25 @@ not from a build directory.
 
 - **`VolBoostApp.swift`** — `@main` + `AppDelegate`: status item, popover, `.accessory`
   activation policy.
-- **`AudioTapManager.swift`** — all Core Audio logic. Polls
-  `kAudioHardwarePropertyProcessObjectList` every 1.5s for processes with
-  `kAudioProcessPropertyIsRunningOutput == 1`. When you first adjust an app, it builds a
-  `TapSession`: a `CATapDescription(stereoMixdownOfProcesses:)` tap with
-  `muteBehavior = .mutedWhenTapped`, wrapped in a private aggregate device whose main
-  sub-device is the current default output. Its `AudioDeviceIOProc` reads the tapped
-  float samples, multiplies by gain, and writes them to the output device — so the app's
-  direct path is silenced and ours replaces it.
+- **`AudioTapManager.swift`** — all Core Audio logic. Lists
+  `kAudioHardwarePropertyProcessObjectList` for processes with
+  `kAudioProcessPropertyIsRunningOutput == 1`, re-reading it whenever coreaudiod
+  announces a change to either property (a 1.5s poll remains as the safety net). When
+  you first adjust an app, it builds a `TapSession`: a
+  `CATapDescription(stereoMixdownOfProcesses:)` tap wrapped in a private aggregate
+  device whose main sub-device is the current default output. Its `AudioDeviceIOProc`
+  reads the tapped float samples, multiplies by gain, and writes them to the output
+  device — so the app's direct path is silenced and ours replaces it.
+
+  The first tap on any app is a **probe**: `muteBehavior = .unmuted`, output all
+  zeros. `AudioHardwareCreateProcessTap` returns `noErr` even when macOS intends to
+  feed the tap nothing but silence — audio-recording access denied, most often — so a
+  tap that muted the app on creation could leave it silent for good. The probe changes
+  nothing you can hear; it just waits for the first non-zero sample. That sample proves
+  the pipeline works, the probe is swapped for a `.mutedWhenTapped` session carrying
+  the real gain, and every later tap goes live immediately. Until it arrives the row
+  says so, and after a few seconds of a "playing" app producing nothing it points you at
+  the permission.
 - **`PopoverView.swift`** — the SwiftUI popover.
 
 `LoginItem` (in `VolBoostApp.swift`) holds no state of its own; `isEnabled` is derived
@@ -94,9 +105,13 @@ square waves.
 - A remembered volume is re-applied silently when the app next plays audio. If that
   fails, VolBoost does not retry for that app until you touch its slider again —
   otherwise the refresh timer would re-alert every 1.5 seconds.
-- A tap pipeline is created on first adjustment and kept until the process exits. Dragging
-  back to exactly 100% is a passthrough `memcpy`; tearing the aggregate device down
-  mid-drag would glitch the audio instead.
+- The first few milliseconds an app plays, before the probe has heard it, come through at
+  the app's own volume. Once any tap has delivered audio in this run, new taps skip the
+  probe.
+- A tap pipeline is kept until the process exits or the slider has rested at exactly 100%
+  for a second, at which point the app gets its own output back. Passing through 100%
+  mid-drag is a passthrough `memcpy`; tearing the aggregate device down there would
+  glitch the audio instead.
 - Output is re-rendered to the **default** output device. An app deliberately playing to a
   different device gets moved to the default one once you control it.
 - The tap is a stereo mixdown. On a >2-channel output device, only the first two channels

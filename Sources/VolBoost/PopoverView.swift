@@ -126,6 +126,29 @@ private struct AppRow: View {
                 .controlSize(.small)
                 .disabled(app.isMuted)
             }
+
+            // A probe is listening before we take the app's audio over, so a
+            // silent app is never muted by a tap that turns out to be dead. Say
+            // so, and once it has gone on long enough, say what it usually means.
+            if app.isStalled {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Nothing from \(app.name) has reached VolBoost yet. If it is "
+                         + "playing, audio-recording access is probably off.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Check audio access") { manager.openAudioAccessSettings() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.accentColor)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else if app.isWaitingForAudio {
+                Text("Takes effect as soon as \(app.name) plays.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)

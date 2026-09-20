@@ -66,34 +66,67 @@ private func readObjectIDs(_ objectID: AudioObjectID,
 
 // MARK: - One tap + aggregate device pipeline for a single process
 
-/// Captures one process's output through a muted process tap, applies gain,
-/// and re-renders the result to the default output device.
+/// Captures one process's output through a process tap and, when live,
+/// re-renders it with gain to the default output device.
+///
+/// A session starts as a **probe** whenever we do not yet know that macOS will
+/// actually hand us this process's audio. `AudioHardwareCreateProcessTap`
+/// returns noErr for a tap it will only ever feed silence — audio-recording
+/// access missing, or audio it protects — so the status code cannot tell us the
+/// pipeline is alive. A probe leaves the app's own path to the hardware unmuted
+/// and writes silence to the device, which is inaudible either way, while it
+/// watches for a single non-zero sample. Only once one arrives does the manager
+/// replace it with a live session that mutes the app and renders in its place.
+/// Nothing the user hears can therefore be lost to a tap that never worked.
 private final class TapSession {
+    let isProbe: Bool
+
     /// Read on the realtime IO thread, written from the main thread. A single
     /// aligned 32-bit store is atomic on every platform we target, so no lock
     /// (and therefore no priority inversion) is needed in the render callback.
     private let gainStorage = UnsafeMutablePointer<Float>.allocate(capacity: 1)
+
+    /// Written on the IO thread, read from the main thread — same single-aligned-
+    /// 32-bit-store argument as the gain.
+    private struct Stats {
+        var sawAudio: UInt32 = 0
+        var silentSamples: UInt32 = 0
+    }
+    private let statsStorage = UnsafeMutablePointer<Stats>.allocate(capacity: 1)
 
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
     private var isRunning = false
 
+    /// Ignored by a probe's render, which always writes silence, but kept so the
+    /// value survives the switch to a live session.
     var gain: Float {
         get { gainStorage.pointee }
         set { gainStorage.pointee = max(0, newValue) }
     }
 
-    init(processObjectID: AudioObjectID, pid: pid_t, outputDeviceUID: String, gain: Float) throws {
+    /// True once the tap has handed us any non-zero sample.
+    var hasDeliveredAudio: Bool { statsStorage.pointee.sawAudio != 0 }
+
+    /// Samples of unbroken silence since the tap started, counted only until the
+    /// first real sample arrives. Roughly 96k per second of stereo 48 kHz.
+    var silentSampleCount: UInt32 { statsStorage.pointee.silentSamples }
+
+    init(processObjectID: AudioObjectID, pid: pid_t, outputDeviceUID: String,
+         gain: Float, probe: Bool) throws {
+        isProbe = probe
         gainStorage.initialize(to: max(0, gain))
+        statsStorage.initialize(to: Stats())
 
         let description = CATapDescription(stereoMixdownOfProcesses: [processObjectID])
         description.name = "VolBoost-\(pid)"
         description.uuid = UUID()
         description.isPrivate = true
-        // Silence the app's own path to the hardware only while we are actively
-        // reading the tap, so audio is never lost if our IOProc stops.
-        description.muteBehavior = .mutedWhenTapped
+        // Live: silence the app's own path to the hardware only while we are
+        // actively reading the tap, so audio is never lost if our IOProc stops.
+        // Probe: leave the app alone entirely; we are only listening.
+        description.muteBehavior = probe ? .unmuted : .mutedWhenTapped
 
         try TapError.check(AudioHardwareCreateProcessTap(description, &tapID),
                            "AudioHardwareCreateProcessTap")
@@ -122,10 +155,13 @@ private final class TapSession {
                 "AudioHardwareCreateAggregateDevice")
 
             let storage = gainStorage
+            let stats = statsStorage
+            let silent = probe
             try TapError.check(
                 AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateID, nil) {
                     _, inputData, _, outputData, _ in
-                    TapSession.render(gain: storage.pointee, input: inputData, output: outputData)
+                    TapSession.render(gain: silent ? 0 : storage.pointee, stats: stats,
+                                      input: inputData, output: outputData)
                 },
                 "AudioDeviceCreateIOProcIDWithBlock")
 
@@ -139,11 +175,18 @@ private final class TapSession {
 
     /// Realtime render callback. No allocation, locking, or Obj-C messaging.
     private static func render(gain: Float,
+                               stats: UnsafeMutablePointer<Stats>,
                                input: UnsafePointer<AudioBufferList>,
                                output: UnsafeMutablePointer<AudioBufferList>) {
         let inputBuffers = UnsafeMutableAudioBufferListPointer(
             UnsafeMutablePointer(mutating: input))
         let outputBuffers = UnsafeMutableAudioBufferListPointer(output)
+
+        // Only until the tap proves itself: a scan per callback forever would be
+        // wasted work on the realtime thread.
+        let watchingForSilence = stats.pointee.sawAudio == 0
+        var silentSamples: UInt32 = 0
+        var sawAudio = false
 
         let paired = min(inputBuffers.count, outputBuffers.count)
         for index in 0..<paired {
@@ -153,6 +196,13 @@ private final class TapSession {
                 continue
             }
             let copyBytes = min(Int(source.mDataByteSize), Int(destination.mDataByteSize))
+
+            if watchingForSilence, !sawAudio {
+                let scanned = copyBytes / MemoryLayout<Float>.size
+                let src = sourceData.assumingMemoryBound(to: Float.self)
+                for sample in 0..<scanned where src[sample] != 0 { sawAudio = true; break }
+                if !sawAudio { silentSamples &+= UInt32(scanned) }
+            }
 
             if gain == 1 {
                 memcpy(destinationData, sourceData, copyBytes)
@@ -181,6 +231,17 @@ private final class TapSession {
                 memset(data, 0, Int(outputBuffers[index].mDataByteSize))
             }
         }
+
+        if watchingForSilence {
+            if sawAudio {
+                stats.pointee.sawAudio = 1
+            } else {
+                // Saturate rather than wrap: a probe left listening all day must
+                // not flip back to "just started".
+                let total = UInt64(stats.pointee.silentSamples) + UInt64(silentSamples)
+                stats.pointee.silentSamples = UInt32(min(total, UInt64(UInt32.max)))
+            }
+        }
     }
 
     func invalidate() {
@@ -205,6 +266,7 @@ private final class TapSession {
     deinit {
         invalidate()
         gainStorage.deallocate()
+        statsStorage.deallocate()
     }
 }
 
@@ -247,7 +309,13 @@ final class AudioTapManager: ObservableObject {
         var gainPercent: Double   // 100 == unity
         var isMuted: Bool
         var boostEnabled: Bool
-        var isControlled: Bool    // a tap pipeline is live for this app
+        /// Our render has replaced this app's own output.
+        var isControlled: Bool
+        /// A probe is listening for this app's first sample before we take over.
+        var isWaitingForAudio: Bool
+        /// The probe has heard nothing for a while although the app says it is
+        /// playing — the sign that audio-recording access is probably missing.
+        var isStalled: Bool
 
         static func == (lhs: AudioApp, rhs: AudioApp) -> Bool {
             lhs.id == rhs.id
@@ -256,6 +324,8 @@ final class AudioTapManager: ObservableObject {
                 && lhs.isMuted == rhs.isMuted
                 && lhs.boostEnabled == rhs.boostEnabled
                 && lhs.isControlled == rhs.isControlled
+                && lhs.isWaitingForAudio == rhs.isWaitingForAudio
+                && lhs.isStalled == rhs.isStalled
         }
     }
 
@@ -275,35 +345,141 @@ final class AudioTapManager: ObservableObject {
     }
 
     private static let settingsDefaultsKey = "VolBoost.settings"
+
+    /// Roughly five seconds of stereo 48 kHz. A probe that has heard nothing in
+    /// that long while its process claims to be playing is worth a hint — only a
+    /// hint, because a quiet call or a paused player looks exactly the same.
+    private static let stalledSampleThreshold: UInt32 = 480_000
+
+    /// Audio that belongs to an app the user knows, but is rendered by a helper
+    /// process. FaceTime is the one that matters: call audio comes out of
+    /// `avconferenced`, so a row labelled "avconferenced" was the only way to
+    /// reach it — and the FaceTime row itself only carries ringtones.
+    private static let helperProcesses: [String: (name: String, iconOwner: String)] = [
+        "com.apple.avconferenced": ("FaceTime call audio", "com.apple.FaceTime"),
+    ]
+
     private var settings: [String: Settings] = [:]
     /// Apps whose remembered volume could not be re-applied. Without this the
     /// refresh timer would retry — and re-alert — every 1.5 seconds.
     private var autoStartFailed: Set<String> = []
     private var sessions: [pid_t: TapSession] = [:]
+    /// Pending "back at 100%, let the app have its own audio again" teardowns,
+    /// debounced so dragging through unity mid-gesture does not glitch playback.
+    private var teardownTimers: [pid_t: Timer] = [:]
     private var refreshTimer: Timer?
+    /// Runs only while a probe exists, so the switch to live happens within a
+    /// tenth of a second of the first sample rather than at the next slow refresh.
+    private var probeTimer: Timer?
     private var hasShownPermissionAlert = false
+    private var helperIcons: [String: NSImage?] = [:]
+    /// Set the first time any tap delivers a sample: from then on we know the
+    /// permission is granted and new sessions can go live immediately.
+    private var permissionProven = false
+
+    private var deviceListener: AudioObjectPropertyListenerBlock?
+    private var processListListener: AudioObjectPropertyListenerBlock?
+    /// One listener per process object, so an app starting to play is noticed
+    /// at once instead of at the next poll.
+    private var processListeners: [AudioObjectID: AudioObjectPropertyListenerBlock] = [:]
+    private var refreshQueued = false
 
     // MARK: Lifecycle
 
     func start() {
         loadSettings()
         refresh()
+        // The listeners below do the real work; this is the safety net for
+        // anything coreaudiod does not announce.
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             self?.refresh()
         }
-        var address = propertyAddress(kAudioHardwarePropertyDefaultOutputDevice)
-        AudioObjectAddPropertyListenerBlock(
-            AudioObjectID(kAudioObjectSystemObject), &address, .main
-        ) { [weak self] _, _ in
+
+        let system = AudioObjectID(kAudioObjectSystemObject)
+
+        var deviceAddress = propertyAddress(kAudioHardwarePropertyDefaultOutputDevice)
+        let deviceListener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             self?.rebuildSessions()
         }
+        AudioObjectAddPropertyListenerBlock(system, &deviceAddress, .main, deviceListener)
+        self.deviceListener = deviceListener
+
+        var listAddress = propertyAddress(kAudioHardwarePropertyProcessObjectList)
+        let listListener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.requestRefresh()
+        }
+        AudioObjectAddPropertyListenerBlock(system, &listAddress, .main, listListener)
+        self.processListListener = listListener
     }
 
     func stop() {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        probeTimer?.invalidate()
+        probeTimer = nil
+        for timer in teardownTimers.values { timer.invalidate() }
+        teardownTimers.removeAll()
         for session in sessions.values { session.invalidate() }
         sessions.removeAll()
+
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        if let deviceListener {
+            var address = propertyAddress(kAudioHardwarePropertyDefaultOutputDevice)
+            AudioObjectRemovePropertyListenerBlock(system, &address, .main, deviceListener)
+            self.deviceListener = nil
+        }
+        if let processListListener {
+            var address = propertyAddress(kAudioHardwarePropertyProcessObjectList)
+            AudioObjectRemovePropertyListenerBlock(system, &address, .main, processListListener)
+            self.processListListener = nil
+        }
+        syncProcessListeners(with: [])
+    }
+
+    /// Coalesces a burst of notifications into one refresh on the next turn of
+    /// the run loop.
+    private func requestRefresh() {
+        guard !refreshQueued else { return }
+        refreshQueued = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.refreshQueued = false
+            self.refresh()
+        }
+    }
+
+    private func syncProcessListeners(with objectIDs: Set<AudioObjectID>) {
+        var address = propertyAddress(kAudioProcessPropertyIsRunningOutput)
+        for objectID in Array(processListeners.keys) where !objectIDs.contains(objectID) {
+            if let block = processListeners.removeValue(forKey: objectID) {
+                // The object is usually gone by now; a failure here is expected.
+                AudioObjectRemovePropertyListenerBlock(objectID, &address, .main, block)
+            }
+        }
+        for objectID in objectIDs where processListeners[objectID] == nil {
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                self?.requestRefresh()
+            }
+            if AudioObjectAddPropertyListenerBlock(objectID, &address, .main, block) == noErr {
+                processListeners[objectID] = block
+            }
+        }
+    }
+
+    private func updateProbeTimer() {
+        let probing = sessions.values.contains { $0.isProbe }
+        if probing, probeTimer == nil {
+            probeTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                // Cheap check first; the full refresh only when there is news.
+                if self.sessions.values.contains(where: { $0.isProbe && $0.hasDeliveredAudio }) {
+                    self.refresh()
+                }
+            }
+        } else if !probing, let probeTimer {
+            probeTimer.invalidate()
+            self.probeTimer = nil
+        }
     }
 
     // MARK: Discovery
@@ -313,9 +489,13 @@ final class AudioTapManager: ObservableObject {
         let ownBundleID = Bundle.main.bundleIdentifier
         var discovered: [AudioApp] = []
         var livePIDs: Set<pid_t> = []
+        var liveKeys: Set<String> = []
 
-        for objectID in readObjectIDs(AudioObjectID(kAudioObjectSystemObject),
-                                      kAudioHardwarePropertyProcessObjectList) {
+        let objectIDs = readObjectIDs(AudioObjectID(kAudioObjectSystemObject),
+                                      kAudioHardwarePropertyProcessObjectList)
+        syncProcessListeners(with: Set(objectIDs))
+
+        for objectID in objectIDs {
             guard let pid: pid_t = readValue(objectID, kAudioProcessPropertyPID, pid_t(0)),
                   pid > 0, pid != ownPID
             else { continue }
@@ -333,14 +513,32 @@ final class AudioTapManager: ObservableObject {
             // A second VolBoost instance would otherwise be offered as a target,
             // and tapping our own re-rendered output is a feedback loop.
             if let bundleID, bundleID == ownBundleID { continue }
-            let name = runningApp?.localizedName
+            let helper = bundleID.flatMap { Self.helperProcesses[$0] }
+            let name = helper?.name
+                ?? runningApp?.localizedName
                 ?? bundleID?.split(separator: ".").last.map(String.init)
                 ?? "PID \(pid)"
+            let icon = helper.map { helperIcon(for: $0.iconOwner) } ?? runningApp?.icon
 
             // Processes without a bundle ID cannot be recognised next launch; they
             // still work for this session, they just do not persist.
             let settingsKey = bundleID ?? "pid:\(pid)"
+            liveKeys.insert(settingsKey)
+
             let appSettings = settings[settingsKey] ?? Settings()
+
+            // A probe that has heard audio proves both that macOS is handing us
+            // this process and that audio-recording access is granted. Take over.
+            if let session = sessions[pid], session.isProbe, session.hasDeliveredAudio {
+                permissionProven = true
+                sessions.removeValue(forKey: pid)?.invalidate()
+                if appSettings.needsTap {
+                    let started = startSession(for: pid, objectID: objectID, name: name,
+                                               gain: appSettings.linearGain,
+                                               announceFailure: false)
+                    if !started { autoStartFailed.insert(settingsKey) }
+                }
+            }
 
             // A remembered volume has to be re-applied when the app comes back,
             // otherwise persisting it was pointless. Silent: the user did not ask
@@ -353,22 +551,35 @@ final class AudioTapManager: ObservableObject {
                 if !started { autoStartFailed.insert(settingsKey) }
             }
 
+            let session = sessions[pid]
+            let probing = session?.isProbe ?? false
+            let stalled = probing && isRunningOutput
+                && (session?.silentSampleCount ?? 0) > Self.stalledSampleThreshold
             discovered.append(AudioApp(id: pid,
                                        objectID: objectID,
                                        settingsKey: settingsKey,
                                        name: name,
-                                       icon: runningApp?.icon,
+                                       icon: icon,
                                        gainPercent: appSettings.gainPercent,
                                        isMuted: appSettings.isMuted,
                                        boostEnabled: appSettings.boostEnabled,
-                                       isControlled: sessions[pid] != nil))
+                                       isControlled: session != nil && !probing,
+                                       isWaitingForAudio: probing,
+                                       isStalled: stalled))
         }
 
         // Tear down pipelines for processes that are gone. Their settings stay:
         // that is the whole point of keying them by bundle ID.
         for pid in Array(sessions.keys) where !livePIDs.contains(pid) {
             sessions.removeValue(forKey: pid)?.invalidate()
+            teardownTimers.removeValue(forKey: pid)?.invalidate()
         }
+
+        // A failure belongs to the run of the app that hit it. Once that app is
+        // gone, its next launch deserves a fresh attempt.
+        autoStartFailed.formIntersection(liveKeys)
+
+        updateProbeTimer()
 
         let sorted = discovered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         if sorted != apps { apps = sorted }
@@ -409,13 +620,25 @@ final class AudioTapManager: ObservableObject {
         }
         persistSettings()
 
-        if appSettings.needsTap, sessions[app.id] == nil {
-            startSession(for: app, gain: appSettings.linearGain)
-        } else {
-            // Once a pipeline exists, keep it. Dragging back through 100% is a
-            // passthrough memcpy, and tearing the aggregate device down mid-drag
-            // would glitch the audio.
-            sessions[app.id]?.gain = appSettings.linearGain
+        if appSettings.needsTap {
+            cancelTeardown(app.id)
+            if let session = sessions[app.id] {
+                session.gain = appSettings.linearGain
+            } else {
+                startSession(for: app, gain: appSettings.linearGain)
+            }
+        } else if let session = sessions[app.id] {
+            session.gain = appSettings.linearGain
+            if session.isProbe {
+                // Nothing to hand back — a probe never took the app's audio away.
+                sessions.removeValue(forKey: app.id)?.invalidate()
+            } else {
+                // Unity gain is a passthrough memcpy, so the pipeline can stay
+                // while the gesture is still moving — tearing the aggregate device
+                // down mid-drag would glitch the audio. Once the value settles at
+                // 100%, though, hand the app back its own output.
+                scheduleTeardown(app.id)
+            }
         }
         refresh()
     }
@@ -434,7 +657,9 @@ final class AudioTapManager: ObservableObject {
             sessions[pid] = try TapSession(processObjectID: objectID,
                                            pid: pid,
                                            outputDeviceUID: outputUID,
-                                           gain: gain)
+                                           gain: gain,
+                                           probe: !permissionProven)
+            updateProbeTimer()
             return true
         } catch let error as TapError {
             // The permission alert is worth showing either way — it is shown once
@@ -450,6 +675,41 @@ final class AudioTapManager: ObservableObject {
             // silently discard a volume the user chose.
             return false
         }
+    }
+
+    /// Give the app its own (unmuted) output back once the slider has settled at
+    /// 100% for long enough that this is clearly not a drag passing through.
+    private func scheduleTeardown(_ pid: pid_t) {
+        cancelTeardown(pid)
+        teardownTimers[pid] = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) {
+            [weak self] _ in
+            guard let self else { return }
+            self.teardownTimers.removeValue(forKey: pid)
+            // Re-check: the user may have moved off 100% again while we waited.
+            if let app = self.apps.first(where: { $0.id == pid }),
+               (self.settings[app.settingsKey] ?? Settings()).needsTap { return }
+            self.sessions.removeValue(forKey: pid)?.invalidate()
+            self.refresh()
+        }
+    }
+
+    private func cancelTeardown(_ pid: pid_t) {
+        teardownTimers.removeValue(forKey: pid)?.invalidate()
+    }
+
+    func openAudioAccessSettings() {
+        guard let url = URL(string:
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture")
+        else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func helperIcon(for bundleID: String) -> NSImage? {
+        if let cached = helperIcons[bundleID] { return cached }
+        let icon = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+            .map { NSWorkspace.shared.icon(forFile: $0.path) }
+        helperIcons[bundleID] = icon
+        return icon
     }
 
     // MARK: Persistence
@@ -473,7 +733,12 @@ final class AudioTapManager: ObservableObject {
         sessions.removeAll()
         for app in controlled {
             let appSettings = settings[app.settingsKey] ?? Settings()
-            if appSettings.needsTap { startSession(for: app, gain: appSettings.linearGain) }
+            guard appSettings.needsTap else { continue }
+            // Silent: the user changed an output device, not a slider, and one
+            // alert per controlled app would be a pile-up.
+            let started = startSession(for: app.id, objectID: app.objectID, name: app.name,
+                                       gain: appSettings.linearGain, announceFailure: false)
+            if !started { autoStartFailed.insert(app.settingsKey) }
         }
         refresh()
     }
@@ -496,13 +761,14 @@ final class AudioTapManager: ObservableObject {
         let alert = NSAlert()
         alert.messageText = "VolBoost needs audio-recording access"
         alert.informativeText = "macOS requires audio-recording permission to tap an app's output, "
-            + "which is how VolBoost changes that app's volume — allow it, then move the slider again."
+            + "which is how VolBoost changes that app's volume.\n\n"
+            + "Allow it, then move the slider again. Each rebuild of VolBoost is re-signed, so "
+            + "macOS treats it as a new app and asks again."
         alert.addButton(withTitle: "Open System Settings")
         alert.addButton(withTitle: "Later")
         NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn,
-           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
-            NSWorkspace.shared.open(url)
+        if alert.runModal() == .alertFirstButtonReturn {
+            openAudioAccessSettings()
         }
     }
 
