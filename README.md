@@ -30,9 +30,10 @@ you move a slider or hit mute, macOS prompts; VolBoost also shows a one-line
 explanation if the tap is refused, with a button to
 **System Settings → Privacy & Security → Microphone**.
 
-Because the bundle is ad-hoc signed, its code identity is its binary hash — macOS
-treats every rebuild as a different app and asks again. Build once, copy to
-`/Applications`, grant once.
+The bundle is ad-hoc signed, which by default makes its code identity the binary
+hash, so macOS would treat every rebuild as a different app and ask again.
+`build-app.sh` pins the designated requirement to the bundle ID instead, so the grant
+survives rebuilds.
 
 ## Using it
 
@@ -51,7 +52,7 @@ it comes back at 40% the moment it plays audio again. Drag an app back to 100% a
 unmute it and VolBoost forgets it entirely rather than storing a no-op.
 
 A process with no bundle identifier (some helpers) still works for the current
-session, it just cannot be recognised next launch.
+session, it just cannot be recognised next launch, so its setting is never saved.
 
 Right-click the menu bar icon (or use **Quit** in the popover) to exit.
 
@@ -115,5 +116,6 @@ square waves.
 - Output is re-rendered to the **default** output device. An app deliberately playing to a
   different device gets moved to the default one once you control it.
 - The tap is a stereo mixdown. On a >2-channel output device, only the first two channels
-  are fed; the rest are silenced for that app.
+  are fed; the rest are silenced for that app. A mono device gets left and right folded
+  together.
 - Adding the tap inserts one extra buffer of latency into that app's path.

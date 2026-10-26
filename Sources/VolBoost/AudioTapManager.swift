@@ -52,8 +52,10 @@ private func readString(_ objectID: AudioObjectID,
 }
 
 private func readObjectIDs(_ objectID: AudioObjectID,
-                           _ selector: AudioObjectPropertySelector) -> [AudioObjectID] {
-    var address = propertyAddress(selector)
+                           _ selector: AudioObjectPropertySelector,
+                           scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal)
+    -> [AudioObjectID] {
+    var address = propertyAddress(selector, scope: scope)
     var size: UInt32 = 0
     guard AudioObjectGetPropertyDataSize(objectID, &address, 0, nil, &size) == noErr, size > 0
     else { return [] }
@@ -113,8 +115,8 @@ private final class TapSession {
     /// first real sample arrives. Roughly 96k per second of stereo 48 kHz.
     var silentSampleCount: UInt32 { statsStorage.pointee.silentSamples }
 
-    init(processObjectID: AudioObjectID, pid: pid_t, outputDeviceUID: String,
-         gain: Float, probe: Bool) throws {
+    init(processObjectID: AudioObjectID, pid: pid_t, outputDeviceID: AudioObjectID,
+         outputDeviceUID: String, gain: Float, probe: Bool) throws {
         isProbe = probe
         gainStorage.initialize(to: max(0, gain))
         statsStorage.initialize(to: Stats())
@@ -157,10 +159,17 @@ private final class TapSession {
             let storage = gainStorage
             let stats = statsStorage
             let silent = probe
+            // The aggregate's input side lists the output device's own input
+            // streams — a USB headset's microphone, an interface's line-ins —
+            // ahead of the tap's. Skip them, or we would play the mic back into
+            // the headphones in place of the app.
+            let tapOffset = readObjectIDs(outputDeviceID, kAudioDevicePropertyStreams,
+                                          scope: kAudioObjectPropertyScopeInput).count
             try TapError.check(
                 AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateID, nil) {
                     _, inputData, _, outputData, _ in
                     TapSession.render(gain: silent ? 0 : storage.pointee, stats: stats,
+                                      tapOffset: tapOffset,
                                       input: inputData, output: outputData)
                 },
                 "AudioDeviceCreateIOProcIDWithBlock")
@@ -176,63 +185,32 @@ private final class TapSession {
     /// Realtime render callback. No allocation, locking, or Obj-C messaging.
     private static func render(gain: Float,
                                stats: UnsafeMutablePointer<Stats>,
+                               tapOffset: Int,
                                input: UnsafePointer<AudioBufferList>,
                                output: UnsafeMutablePointer<AudioBufferList>) {
         let inputBuffers = UnsafeMutableAudioBufferListPointer(
             UnsafeMutablePointer(mutating: input))
         let outputBuffers = UnsafeMutableAudioBufferListPointer(output)
 
+        // Start from silence, so any output channel the tap does not feed is quiet.
+        for buffer in outputBuffers {
+            if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
+        }
+        guard tapOffset < inputBuffers.count else { return }
+        let tapBuffers = tapOffset..<inputBuffers.count
+
         // Only until the tap proves itself: a scan per callback forever would be
         // wasted work on the realtime thread.
-        let watchingForSilence = stats.pointee.sawAudio == 0
-        var silentSamples: UInt32 = 0
-        var sawAudio = false
-
-        let paired = min(inputBuffers.count, outputBuffers.count)
-        for index in 0..<paired {
-            let source = inputBuffers[index]
-            let destination = outputBuffers[index]
-            guard let sourceData = source.mData, let destinationData = destination.mData else {
-                continue
+        if stats.pointee.sawAudio == 0 {
+            var sawAudio = false
+            var silentSamples: UInt32 = 0
+            for index in tapBuffers where !sawAudio {
+                guard let data = inputBuffers[index].mData else { continue }
+                let count = Int(inputBuffers[index].mDataByteSize) / MemoryLayout<Float>.size
+                let src = data.assumingMemoryBound(to: Float.self)
+                for sample in 0..<count where src[sample] != 0 { sawAudio = true; break }
+                if !sawAudio { silentSamples &+= UInt32(count) }
             }
-            let copyBytes = min(Int(source.mDataByteSize), Int(destination.mDataByteSize))
-
-            if watchingForSilence, !sawAudio {
-                let scanned = copyBytes / MemoryLayout<Float>.size
-                let src = sourceData.assumingMemoryBound(to: Float.self)
-                for sample in 0..<scanned where src[sample] != 0 { sawAudio = true; break }
-                if !sawAudio { silentSamples &+= UInt32(scanned) }
-            }
-
-            if gain == 1 {
-                memcpy(destinationData, sourceData, copyBytes)
-            } else if gain == 0 {
-                memset(destinationData, 0, copyBytes)
-            } else {
-                let samples = copyBytes / MemoryLayout<Float>.size
-                let src = sourceData.assumingMemoryBound(to: Float.self)
-                let dst = destinationData.assumingMemoryBound(to: Float.self)
-                if gain <= 1 {
-                    // Attenuation can never overshoot, so skip the limiter.
-                    for sample in 0..<samples { dst[sample] = src[sample] * gain }
-                } else {
-                    for sample in 0..<samples { dst[sample] = softLimit(src[sample] * gain) }
-                }
-            }
-
-            // The tap is stereo; silence any output channels it did not fill.
-            if copyBytes < Int(destination.mDataByteSize) {
-                memset(destinationData + copyBytes, 0,
-                       Int(destination.mDataByteSize) - copyBytes)
-            }
-        }
-        for index in paired..<outputBuffers.count {
-            if let data = outputBuffers[index].mData {
-                memset(data, 0, Int(outputBuffers[index].mDataByteSize))
-            }
-        }
-
-        if watchingForSilence {
             if sawAudio {
                 stats.pointee.sawAudio = 1
             } else {
@@ -242,6 +220,96 @@ private final class TapSession {
                 stats.pointee.silentSamples = UInt32(min(total, UInt64(UInt32.max)))
             }
         }
+        guard gain != 0 else { return }
+
+        // The usual case: the device takes the tap's layout as is (one interleaved
+        // stereo stream), so whole buffers can be copied or scaled.
+        var sameLayout = tapBuffers.count == outputBuffers.count
+        if sameLayout {
+            for (offset, index) in tapBuffers.enumerated()
+            where inputBuffers[index].mNumberChannels != outputBuffers[offset].mNumberChannels {
+                sameLayout = false
+            }
+        }
+        if sameLayout {
+            for (offset, index) in tapBuffers.enumerated() {
+                let source = inputBuffers[index], destination = outputBuffers[offset]
+                guard let sourceData = source.mData, let destinationData = destination.mData
+                else { continue }
+                let bytes = min(Int(source.mDataByteSize), Int(destination.mDataByteSize))
+                if gain == 1 {
+                    memcpy(destinationData, sourceData, bytes)
+                } else {
+                    let src = sourceData.assumingMemoryBound(to: Float.self)
+                    let dst = destinationData.assumingMemoryBound(to: Float.self)
+                    for sample in 0..<(bytes / MemoryLayout<Float>.size) {
+                        dst[sample] = applyGain(src[sample], gain)
+                    }
+                }
+            }
+            return
+        }
+
+        // Otherwise map channel by channel: tap channel n to output channel n, a
+        // mono device gets the two folded together, and anything past the tap's
+        // channels stays silent. Copying bytes across differing layouts would
+        // scramble interleaved frames instead.
+        var outputChannelCount = 0
+        for buffer in outputBuffers { outputChannelCount += Int(buffer.mNumberChannels) }
+        var firstChannel = 0
+        for destination in outputBuffers {
+            let channels = Int(destination.mNumberChannels)
+            defer { firstChannel += channels }
+            guard channels > 0, let destinationData = destination.mData else { continue }
+            let dst = destinationData.assumingMemoryBound(to: Float.self)
+            let frames = Int(destination.mDataByteSize) / (MemoryLayout<Float>.size * channels)
+            for channel in 0..<channels {
+                let global = firstChannel + channel
+                if outputChannelCount == 1 {
+                    let left = tapChannel(0, inputBuffers, tapBuffers)
+                    let right = tapChannel(1, inputBuffers, tapBuffers)
+                    guard let l = left.samples else { continue }
+                    let count = min(frames, left.frames, right.samples == nil ? .max : right.frames)
+                    for frame in 0..<count {
+                        let r = right.samples.map { $0[frame * right.stride] } ?? l[frame * left.stride]
+                        dst[frame] = applyGain((l[frame * left.stride] + r) * 0.5, gain)
+                    }
+                } else {
+                    let source = tapChannel(global, inputBuffers, tapBuffers)
+                    guard let src = source.samples else { continue }
+                    for frame in 0..<min(frames, source.frames) {
+                        dst[frame * channels + channel] = applyGain(src[frame * source.stride], gain)
+                    }
+                }
+            }
+        }
+    }
+
+    @inline(__always)
+    private static func applyGain(_ sample: Float, _ gain: Float) -> Float {
+        // Attenuation can never overshoot, so only a boost needs the limiter.
+        gain <= 1 ? sample * gain : softLimit(sample * gain)
+    }
+
+    /// Where the tap's `channel`-th channel lives: its first sample, the stride
+    /// between frames, and how many frames there are.
+    @inline(__always)
+    private static func tapChannel(_ channel: Int,
+                                   _ buffers: UnsafeMutableAudioBufferListPointer,
+                                   _ range: Range<Int>)
+        -> (samples: UnsafeMutablePointer<Float>?, stride: Int, frames: Int) {
+        var first = 0
+        for index in range {
+            let buffer = buffers[index]
+            let channels = Int(buffer.mNumberChannels)
+            if channel < first + channels, channels > 0, let data = buffer.mData {
+                let base = data.assumingMemoryBound(to: Float.self)
+                let frames = Int(buffer.mDataByteSize) / (MemoryLayout<Float>.size * channels)
+                return (base + (channel - first), channels, frames)
+            }
+            first += channels
+        }
+        return (nil, 0, 0)
     }
 
     func invalidate() {
@@ -345,6 +413,9 @@ final class AudioTapManager: ObservableObject {
     }
 
     private static let settingsDefaultsKey = "VolBoost.settings"
+    /// Settings keyed by pid are for this run only: after a relaunch or reboot the
+    /// same pid belongs to some unrelated process, which must not inherit them.
+    private static let sessionOnlyPrefix = "pid:"
 
     /// Roughly five seconds of stereo 48 kHz. A probe that has heard nothing in
     /// that long while its process claims to be playing is worth a hint — only a
@@ -522,7 +593,7 @@ final class AudioTapManager: ObservableObject {
 
             // Processes without a bundle ID cannot be recognised next launch; they
             // still work for this session, they just do not persist.
-            let settingsKey = bundleID ?? "pid:\(pid)"
+            let settingsKey = bundleID ?? "\(Self.sessionOnlyPrefix)\(pid)"
             liveKeys.insert(settingsKey)
 
             let appSettings = settings[settingsKey] ?? Settings()
@@ -652,11 +723,12 @@ final class AudioTapManager: ObservableObject {
     @discardableResult
     private func startSession(for pid: pid_t, objectID: AudioObjectID, name: String,
                               gain: Float, announceFailure: Bool) -> Bool {
-        guard let outputUID = defaultOutputDeviceUID() else { return false }
+        guard let output = defaultOutputDevice() else { return false }
         do {
             sessions[pid] = try TapSession(processObjectID: objectID,
                                            pid: pid,
-                                           outputDeviceUID: outputUID,
+                                           outputDeviceID: output.id,
+                                           outputDeviceUID: output.uid,
                                            gain: gain,
                                            probe: !permissionProven)
             updateProbeTimer()
@@ -718,11 +790,13 @@ final class AudioTapManager: ObservableObject {
         guard let data = UserDefaults.standard.data(forKey: Self.settingsDefaultsKey),
               let stored = try? JSONDecoder().decode([String: Settings].self, from: data)
         else { return }
-        settings = stored
+        // Earlier builds saved pid-keyed entries too; drop them.
+        settings = stored.filter { !$0.key.hasPrefix(Self.sessionOnlyPrefix) }
     }
 
     private func persistSettings() {
-        guard let data = try? JSONEncoder().encode(settings) else { return }
+        let lasting = settings.filter { !$0.key.hasPrefix(Self.sessionOnlyPrefix) }
+        guard let data = try? JSONEncoder().encode(lasting) else { return }
         UserDefaults.standard.set(data, forKey: Self.settingsDefaultsKey)
     }
 
@@ -743,13 +817,14 @@ final class AudioTapManager: ObservableObject {
         refresh()
     }
 
-    private func defaultOutputDeviceUID() -> String? {
+    private func defaultOutputDevice() -> (id: AudioObjectID, uid: String)? {
         guard let deviceID: AudioObjectID = readValue(AudioObjectID(kAudioObjectSystemObject),
                                                       kAudioHardwarePropertyDefaultOutputDevice,
                                                       AudioObjectID(kAudioObjectUnknown)),
-              deviceID != kAudioObjectUnknown
+              deviceID != kAudioObjectUnknown,
+              let uid = readString(deviceID, kAudioDevicePropertyDeviceUID)
         else { return nil }
-        return readString(deviceID, kAudioDevicePropertyDeviceUID)
+        return (deviceID, uid)
     }
 
     // MARK: Alerts
@@ -762,8 +837,7 @@ final class AudioTapManager: ObservableObject {
         alert.messageText = "VolBoost needs audio-recording access"
         alert.informativeText = "macOS requires audio-recording permission to tap an app's output, "
             + "which is how VolBoost changes that app's volume.\n\n"
-            + "Allow it, then move the slider again. Each rebuild of VolBoost is re-signed, so "
-            + "macOS treats it as a new app and asks again."
+            + "Allow it, then move the slider again."
         alert.addButton(withTitle: "Open System Settings")
         alert.addButton(withTitle: "Later")
         NSApp.activate(ignoringOtherApps: true)
